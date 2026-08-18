@@ -4,6 +4,10 @@
  * Detecta pestañas duplicadas en sitios protegidos y las cierra
  * automáticamente, enfocando la pestaña original.
  *
+ * Incluye además el módulo Auto-Launcher de Dux: al completar la carga
+ * de `/duxnew/inicio`, abre las pestañas de trabajo fijadas y cierra
+ * la pestaña de inicio.
+ *
  * Permisos utilizados:
  *   tabs          — leer URL de pestañas, cerrarlas, activarlas y consultar todas
  *   storage       — persistir configuración y estadísticas localmente
@@ -20,6 +24,29 @@ const STORAGE_STATS_KEY    = 'stats';
 
 /** Tiempo de espera en modo "advertencia" antes de cerrar automáticamente (ms). */
 const WARN_TIMEOUT_MS = 8000;
+
+/**
+ * Fragmento de ruta que dispara el Auto-Launcher de Dux.
+ * Se busca dentro del pathname (cubre query string / trailing slash).
+ */
+const DUX_INICIO_PATH = '/duxnew/inicio';
+
+/** Delay entre cada pestaña abierta por el Auto-Launcher (ms). */
+const DUX_LAUNCH_STAGGER_MS = 100;
+
+/**
+ * URLs que el Auto-Launcher abre (fijadas, en segundo plano)
+ * tras completar la carga de `/duxnew/inicio`.
+ */
+const DUX_AUTO_LAUNCH_URLS = [
+  'https://erp.duxsoftware.com.ar/duxnew/ventas/pos',
+  'https://erp.duxsoftware.com.ar/pages/facturacion/consultas/consultaPrecioStock.faces',
+  'https://docs.google.com/spreadsheets/d/1JC1Nugx6ah0XP4Q_7P_3RvTVc6t7OPWAc_-XYIkPKXo/edit?gid=1806730843#gid=1806730843',
+  'https://catalogo.duxsoftware.com.ar/motos',
+];
+
+/** Clave en chrome.storage.session: Auto-Launcher ya ejecutado en esta sesión. */
+const DUX_LAUNCHED_SESSION_KEY = 'duxWorkspaceLaunched';
 
 /** Configuración por defecto. Se aplica cuando no hay nada guardado en storage. */
 const DEFAULT_SETTINGS = {
@@ -62,6 +89,13 @@ const newlyCreatedTabs = new Set();
  * quedará abierta (comportamiento conservador / no destructivo).
  */
 const warnTimers = new Map();
+
+/**
+ * Lock del Auto-Launcher de Dux.
+ * Evita re-disparos concurrentes mientras la secuencia está en curso.
+ * El "ya lanzó en esta sesión" vive en chrome.storage.session.
+ */
+let isLaunchingDux = false;
 
 // ─── Utilidades de URL ────────────────────────────────────────────────────────
 
@@ -507,6 +541,162 @@ async function loadSettings() {
   }
 }
 
+// ─── Auto-Launcher de Dux ─────────────────────────────────────────────────────
+
+/**
+ * Devuelve true si la URL corresponde a la pantalla de inicio de Dux
+ * que dispara el Auto-Launcher (`/duxnew/inicio`).
+ *
+ * @param {string} rawUrl
+ * @returns {boolean}
+ */
+function isDuxInicioUrl(rawUrl) {
+  if (!rawUrl) return false;
+
+  try {
+    return new URL(rawUrl).pathname.includes(DUX_INICIO_PATH);
+  } catch {
+    return rawUrl.includes(DUX_INICIO_PATH);
+  }
+}
+
+/**
+ * Espera `ms` milisegundos. Usado para el stagger entre pestañas.
+ *
+ * @param {number} ms
+ * @returns {Promise<void>}
+ */
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Normaliza una URL de launch para comparar "¿ya está abierta?".
+ * Usa protocolo + host + pathname (sin trailing slash).
+ *
+ * @param {string} rawUrl
+ * @returns {string|null}
+ */
+function launchUrlKey(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    let pathname = url.pathname;
+    if (pathname.length > 1 && pathname.endsWith('/')) {
+      pathname = pathname.slice(0, -1);
+    }
+    return `${url.protocol}//${url.host}${pathname}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Devuelve true si el workspace de Dux ya fue lanzado en esta sesión
+ * de navegador (sobrevive reinicios del service worker).
+ *
+ * @returns {Promise<boolean>}
+ */
+async function hasLaunchedDuxThisSession() {
+  try {
+    const data = await chrome.storage.session.get(DUX_LAUNCHED_SESSION_KEY);
+    return data[DUX_LAUNCHED_SESSION_KEY] === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Marca el Auto-Launcher como ya ejecutado en esta sesión de navegador.
+ */
+async function markDuxLaunchedThisSession() {
+  try {
+    await chrome.storage.session.set({ [DUX_LAUNCHED_SESSION_KEY]: true });
+  } catch {
+    // No crítico; el lock en memoria sigue cubriendo el disparo concurrente
+  }
+}
+
+/**
+ * Devuelve true si alguna de las URLs del Auto-Launcher ya está abierta.
+ * Evita reabrir el workspace cuando el usuario vuelve a `/duxnew/inicio`
+ * con las pestañas de trabajo todavía presentes.
+ *
+ * @returns {Promise<boolean>}
+ */
+async function isDuxWorkspaceAlreadyOpen() {
+  const launchKeys = new Set(
+    DUX_AUTO_LAUNCH_URLS.map(launchUrlKey).filter(Boolean)
+  );
+
+  let allTabs;
+  try {
+    allTabs = await chrome.tabs.query({});
+  } catch {
+    return false;
+  }
+
+  for (const tab of allTabs) {
+    if (!tab.url || isSystemUrl(tab.url)) continue;
+    const key = launchUrlKey(tab.url);
+    if (key && launchKeys.has(key)) return true;
+  }
+
+  return false;
+}
+
+/**
+ * Abre las pestañas de trabajo de Dux (fijadas, en segundo plano) y
+ * cierra la pestaña de `/duxnew/inicio` que disparó el flujo.
+ *
+ * Se ejecuta una sola vez por sesión de navegador:
+ *   - Lock en memoria (`isLaunchingDux`) contra disparos concurrentes.
+ *   - Flag en `chrome.storage.session` contra revisitas a `/duxnew/inicio`.
+ *   - Si alguna pestaña del workspace ya está abierta, no relanza ni cierra inicio.
+ *
+ * No altera la lógica anti-duplicados: las pestañas creadas pasan por
+ * los listeners normales de DualBlock.
+ *
+ * @param {number} triggerTabId - ID de la pestaña `/duxnew/inicio`
+ */
+async function launchDuxWorkspace(triggerTabId) {
+  if (isLaunchingDux) return;
+  if (await hasLaunchedDuxThisSession()) return;
+  if (await isDuxWorkspaceAlreadyOpen()) {
+    await markDuxLaunchedThisSession();
+    return;
+  }
+
+  isLaunchingDux = true;
+
+  try {
+    for (let i = 0; i < DUX_AUTO_LAUNCH_URLS.length; i++) {
+      if (i > 0) {
+        await delay(DUX_LAUNCH_STAGGER_MS);
+      }
+
+      try {
+        await chrome.tabs.create({
+          url: DUX_AUTO_LAUNCH_URLS[i],
+          pinned: true,
+          active: false,
+        });
+      } catch {
+        // Continuar con el resto si una pestaña falla al crearse
+      }
+    }
+
+    await markDuxLaunchedThisSession();
+
+    try {
+      await chrome.tabs.remove(triggerTabId);
+    } catch {
+      // La pestaña de inicio puede haberse cerrado ya
+    }
+  } finally {
+    isLaunchingDux = false;
+  }
+}
+
 // ─── Listeners de Chrome ──────────────────────────────────────────────────────
 
 /**
@@ -526,24 +716,31 @@ chrome.tabs.onCreated.addListener((tab) => {
 
 /**
  * Una pestaña cambió su URL o estado.
- * changeInfo.url solo está presente cuando la URL efectivamente cambia.
- * Esto captura:
- *   - Navegación normal (incluyendo F5 / actualización)
- *   - Pegar URL en la barra de direcciones
- *   - Abrir desde favoritos / historial
- *   - Abrir desde un enlace (en la misma pestaña o nueva pestaña)
- *   - Cambios de URL SPA si el navegador los propaga a tabs.onUpdated
  *
- * Si el tabId está en newlyCreatedTabs → es una tab nueva → isNewTab = true (cerrar).
- * Si no está → la tab ya existía y navegó in-place → isNewTab = false (volver atrás).
- * Se elimina de newlyCreatedTabs aquí porque onUpdated es el primer evento
- * relevante tras onCreated; ya no se necesita el marcador.
+ * Rama DualBlock (changeInfo.url):
+ *   Captura navegación, pegar URL, favoritos, historial, enlaces, etc.
+ *   Si el tabId está en newlyCreatedTabs → tab nueva → isNewTab = true (cerrar).
+ *   Si no está → navegación in-place → isNewTab = false (volver atrás).
+ *
+ * Rama Auto-Launcher (changeInfo.status === 'complete'):
+ *   Si la URL contiene `/duxnew/inicio`, abre las pestañas de trabajo
+ *   y cierra la de inicio (una sola vez por secuencia, via isLaunchingDux).
  */
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (!changeInfo.url) return;
-  const isNewTab = newlyCreatedTabs.has(tabId);
-  newlyCreatedTabs.delete(tabId);
-  checkTab(tabId, changeInfo.url, isNewTab);
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  // DualBlock — detección de duplicados
+  if (changeInfo.url) {
+    const isNewTab = newlyCreatedTabs.has(tabId);
+    newlyCreatedTabs.delete(tabId);
+    checkTab(tabId, changeInfo.url, isNewTab);
+  }
+
+  // Auto-Launcher de Dux — post-login
+  if (changeInfo.status === 'complete') {
+    const url = (tab && tab.url) || changeInfo.url;
+    if (isDuxInicioUrl(url)) {
+      launchDuxWorkspace(tabId);
+    }
+  }
 });
 
 /**
