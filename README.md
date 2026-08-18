@@ -1,12 +1,14 @@
-# DualBlock
+# DualBlock — Corporate Edition (DUX ERP)
 
-Extensión de Google Chrome que evita tener pestañas duplicadas en cualquier sitio web. Cuando detecta que una pestaña tiene la misma URL que otra ya abierta, cierra la duplicada automáticamente y enfoca la original.
+Extensión de Google Chrome (Manifest V3) que combina la prevención de pestañas duplicadas con un Auto-Launcher específico para DUX ERP. Evita conflictos de sesión en sitios protegidos y, al completar el ingreso a DUX, abre automáticamente el workspace de trabajo fijado.
 
-Ideal para ERPs, CRMs, sistemas de facturación o cualquier aplicación web donde tener la misma pantalla abierta dos veces puede generar conflictos de sesión, datos o procesos.
+Fork de DualBlock orientado al flujo operativo diario con DUX.
 
 ---
 
 ## ¿Qué hace?
+
+### DualBlock Core (anti-duplicados)
 
 Cuando se detecta una URL duplicada en un sitio protegido, la extensión reacciona de forma diferente según cómo se originó la duplicación:
 
@@ -33,6 +35,18 @@ https://app.empresa.com/configuracion
 https://app.empresa.com/facturas  ← pestaña original (se mantiene)
 https://app.empresa.com/facturas  ← DUPLICADA → se cierra automáticamente
 ```
+
+### DUX ERP Auto-Launcher
+
+Cuando el usuario completa la selección de sucursal y llega a la pantalla principal (`/duxnew/inicio`), la extensión:
+
+1. Abre automáticamente estas 4 herramientas, **fijadas** (`pinned: true`) y en segundo plano:
+   - Módulo POS Ventas (`/duxnew/ventas/pos`)
+   - Consulta de Precio y Stock (`/pages/facturacion/consultas/consultaPrecioStock.faces`)
+   - Control de Stock en Google Sheets
+   - Catálogo Web (`/motos`)
+2. Cierra la pestaña de inicio (`/duxnew/inicio`) para dejar la barra limpia.
+3. Evita re-ejecuciones con un lock en memoria (`isLaunchingDux`) y un flag de sesión (`chrome.storage.session`), además de comprobar si el workspace ya está abierto.
 
 ---
 
@@ -62,11 +76,11 @@ Switch global para activar o desactivar toda la extensión. Cuando está desacti
 ### Sitios protegidos
 Lista de dominios donde se aplica la protección. Por defecto está vacía: el usuario agrega los dominios que necesite.
 
-- **Agregar** un dominio: escribirlo sin protocolo (p.ej. `app.empresa.com`) y hacer clic en "+ Agregar sitio".
+- **Agregar** un dominio: escribirlo sin protocolo (p.ej. `erp.duxsoftware.com.ar`) y hacer clic en "+ Agregar sitio".
 - **Activar/desactivar** cada dominio individualmente con su switch.
 - **Eliminar** un dominio con el botón ×.
 
-La extensión también protege subdominios. Si agregás `empresa.com`, también cubrirá `app.empresa.com`.
+La extensión también protege subdominios. Si agregás `duxsoftware.com.ar`, también cubrirá `erp.duxsoftware.com.ar`.
 
 ### Modo de detección
 
@@ -95,7 +109,7 @@ La extensión escucha tres eventos de Chrome:
 | Evento | Qué detecta |
 |--------|-------------|
 | `tabs.onCreated` | Nueva pestaña creada; se registra su ID para saber que es una tab nueva |
-| `tabs.onUpdated` | Cambio de URL en una pestaña; determina si es tab nueva (cerrar) o navegación in-place (volver atrás) |
+| `tabs.onUpdated` | Cambio de URL (anti-duplicados) y carga completa de `/duxnew/inicio` (Auto-Launcher) |
 | `tabs.onRemoved` | Cierre de pestaña (para limpiar estado interno) |
 
 **Distinción nueva pestaña vs. navegación in-place:**
@@ -111,10 +125,14 @@ clave = protocolo + dominio + ruta (sin trailing slash) [+ query + hash en modo 
 
 Los trailing slashes se normalizan: `/page/` y `/page` se tratan como la misma ruta.
 
+**Auto-Launcher de Dux:**
+Cuando `tabs.onUpdated` reporta `status === 'complete'` y la URL contiene `/duxnew/inicio`, se ejecuta `launchDuxWorkspace()`: abre las 4 URLs de trabajo fijadas (con un pequeño stagger entre cada una), marca la sesión como lanzada y cierra la pestaña de inicio. Si el workspace ya está abierto o ya se lanzó en esa sesión de navegador, no vuelve a ejecutar la secuencia.
+
 ---
 
 ## Casos de uso
 
+- Operadores de DUX ERP que al iniciar sesión necesitan el mismo set de herramientas (POS, consulta de stock, planilla, catálogo)
 - ERPs y CRMs con sesiones únicas por pantalla
 - Aplicaciones de facturación o gestión donde abrir la misma pantalla dos veces genera conflictos
 - Herramientas internas con flujos de trabajo críticos
@@ -154,6 +172,12 @@ Los trailing slashes se normalizan: `/page/` y `/page` se tratan como la misma r
 3. Volvé a abrirlo.
 4. ✅ La extensión detecta y cierra el duplicado en los primeros segundos.
 
+### Caso 7 — Auto-Launcher de Dux
+1. Iniciá sesión en DUX y seleccioná sucursal hasta llegar a `/duxnew/inicio`.
+2. ✅ Se abren las 4 pestañas de trabajo fijadas en segundo plano.
+3. ✅ La pestaña de inicio se cierra.
+4. Si volvés a `/duxnew/inicio` en la misma sesión (o con el workspace ya abierto), ✅ no se relanza el workspace.
+
 ---
 
 ## Privacidad y seguridad
@@ -171,8 +195,8 @@ Los trailing slashes se normalizan: `/page/` y `/page` se tratan como la misma r
 
 | Permiso | Motivo |
 |---------|--------|
-| `tabs` | Leer URLs de pestañas, cerrarlas, activarlas y consultar todas las abiertas |
-| `storage` | Persistir configuración (`storage.sync`) y estadísticas (`storage.local`) |
+| `tabs` | Leer URLs de pestañas, cerrarlas, activarlas, crearlas (Auto-Launcher) y consultar todas las abiertas |
+| `storage` | Persistir configuración (`storage.sync`), estadísticas (`storage.local`) y flag de sesión del Auto-Launcher (`storage.session`) |
 | `notifications` | Mostrar aviso cuando se bloquea una pestaña duplicada |
 | `windows` | Enfocar la ventana que contiene la pestaña original |
 
@@ -181,9 +205,9 @@ Los trailing slashes se normalizan: `/page/` y `/page` se tratan como la misma r
 ## Estructura del proyecto
 
 ```
-dualblock/
+DualBlock-DUX/
 ├── manifest.json      ← Configuración (Manifest V3)
-├── background.js      ← Service Worker: lógica de detección y cierre
+├── background.js      ← Service Worker: anti-duplicados + Auto-Launcher Dux
 ├── options.html       ← Página de configuración
 ├── options.css        ← Estilos (modo claro y oscuro)
 ├── options.js         ← Lógica de la UI de configuración
@@ -210,4 +234,4 @@ dualblock/
 
 ## Versión
 
-**1.0.1** — Versión inicial
+**1.0.0** — Corporate Edition: DualBlock Core + Auto-Launcher DUX ERP
