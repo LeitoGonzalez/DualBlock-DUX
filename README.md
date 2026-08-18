@@ -47,6 +47,7 @@ Cuando el usuario completa la selección de sucursal y llega a la pantalla princ
    - Catálogo Web (`/motos`)
 2. Cierra la pestaña de inicio (`/duxnew/inicio`) para dejar la barra limpia.
 3. Evita re-ejecuciones con un lock en memoria (`isLaunchingDux`) y un flag de sesión (`chrome.storage.session`), además de comprobar si el workspace ya está abierto.
+4. Al **reiniciar Chrome**, desfija y cierra las pestañas del workspace que Chrome restauró (no es posible hacerlo al cerrar el navegador). Así el próximo login dispara el Auto-Launcher de nuevo sin pestañas fijadas huérfanas.
 
 ---
 
@@ -128,6 +129,8 @@ Los trailing slashes se normalizan: `/page/` y `/page` se tratan como la misma r
 **Auto-Launcher de Dux:**
 Cuando `tabs.onUpdated` reporta `status === 'complete'` y la URL contiene `/duxnew/inicio`, se ejecuta `launchDuxWorkspace()`: abre las 4 URLs de trabajo fijadas (con un pequeño stagger entre cada una), marca la sesión como lanzada y cierra la pestaña de inicio. Si el workspace ya está abierto o ya se lanzó en esa sesión de navegador, no vuelve a ejecutar la secuencia.
 
+Al arrancar Chrome (`runtime.onStartup`), `cleanupRestoredDuxWorkspaceTabs()` desfija y cierra las pestañas del workspace restauradas. Chrome no notifica a la extensión a tiempo al cerrar el navegador, así que la limpieza se hace al inicio de la siguiente sesión.
+
 ---
 
 ## Casos de uso
@@ -177,6 +180,13 @@ Cuando `tabs.onUpdated` reporta `status === 'complete'` y la URL contiene `/duxn
 2. ✅ Se abren las 4 pestañas de trabajo fijadas en segundo plano.
 3. ✅ La pestaña de inicio se cierra.
 4. Si volvés a `/duxnew/inicio` en la misma sesión (o con el workspace ya abierto), ✅ no se relanza el workspace.
+
+### Caso 8 — Reiniciar Chrome con workspace fijado
+1. Con el workspace DUX ya lanzado (pestañas fijadas), cerrá Chrome por completo.
+2. Volvé a abrirlo (con "Continuar donde lo dejaste" o equivalente).
+3. ✅ En unos segundos se desfijan y cierran las pestañas del workspace restauradas.
+4. Iniciá sesión de nuevo hasta `/duxnew/inicio`.
+5. ✅ El Auto-Launcher vuelve a abrir las 4 herramientas limpias.
 
 ---
 

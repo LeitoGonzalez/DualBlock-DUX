@@ -6,7 +6,8 @@
  *
  * Incluye además el módulo Auto-Launcher de Dux: al completar la carga
  * de `/duxnew/inicio`, abre las pestañas de trabajo fijadas y cierra
- * la pestaña de inicio.
+ * la pestaña de inicio. Al reiniciar Chrome limpia (desfija + cierra)
+ * esas pestañas restauradas, porque MV3 no permite hacerlo al cerrar.
  *
  * Permisos utilizados:
  *   tabs          — leer URL de pestañas, cerrarlas, activarlas y consultar todas
@@ -45,9 +46,20 @@ const DUX_AUTO_LAUNCH_URLS = [
   'https://catalogo.duxsoftware.com.ar/motos',
 ];
 
+/**
+ * Hosts del workspace DUX. Al arrancar Chrome se cierran pestañas fijadas
+ * en estos dominios (pueden haber quedado en login tras restaurar sesión).
+ */
+const DUX_WORKSPACE_HOSTS = [
+  'erp.duxsoftware.com.ar',
+  'catalogo.duxsoftware.com.ar',
+];
+
+/** ID de la planilla de stock usada por el Auto-Launcher. */
+const DUX_STOCK_SHEET_ID = '1JC1Nugx6ah0XP4Q_7P_3RvTVc6t7OPWAc_-XYIkPKXo';
+
 /** Clave en chrome.storage.session: Auto-Launcher ya ejecutado en esta sesión. */
 const DUX_LAUNCHED_SESSION_KEY = 'duxWorkspaceLaunched';
-
 /** Configuración por defecto. Se aplica cuando no hay nada guardado en storage. */
 const DEFAULT_SETTINGS = {
   enabled: true,
@@ -645,6 +657,81 @@ async function isDuxWorkspaceAlreadyOpen() {
 }
 
 /**
+ * Indica si una pestaña pertenece al workspace que abre el Auto-Launcher.
+ * Incluye URLs exactas de launch y pestañas fijadas en hosts DUX / la planilla
+ * (p.ej. restauradas por Chrome ya redirigidas al login).
+ *
+ * @param {chrome.tabs.Tab} tab
+ * @returns {boolean}
+ */
+function isDuxWorkspaceTab(tab) {
+  if (!tab || !tab.url || isSystemUrl(tab.url)) return false;
+
+  const launchKeys = new Set(
+    DUX_AUTO_LAUNCH_URLS.map(launchUrlKey).filter(Boolean)
+  );
+  const key = launchUrlKey(tab.url);
+  if (key && launchKeys.has(key)) return true;
+
+  // Tras restaurar sesión, la URL puede ser login u otra ruta del mismo host.
+  if (!tab.pinned) return false;
+
+  try {
+    const url = new URL(tab.url);
+    const host = url.hostname.toLowerCase();
+
+    if (DUX_WORKSPACE_HOSTS.some((h) => host === h || host.endsWith('.' + h))) {
+      return true;
+    }
+
+    if (
+      host === 'docs.google.com' &&
+      url.pathname.includes(`/spreadsheets/d/${DUX_STOCK_SHEET_ID}`)
+    ) {
+      return true;
+    }
+  } catch {
+    return false;
+  }
+
+  return false;
+}
+
+/**
+ * Al arrancar Chrome, desfija y cierra las pestañas del workspace DUX
+ * que Chrome restauró de la sesión anterior.
+ *
+ * No es posible desfijar al cerrar el navegador (MV3 no notifica a tiempo
+ * antes de guardar la sesión). Esta limpieza al startup evita pestañas
+ * fijadas sin sesión válida que, tras el login, caen en `/duxnew/inicio`
+ * y bloquean un nuevo Auto-Launcher.
+ */
+async function cleanupRestoredDuxWorkspaceTabs() {
+  let allTabs;
+  try {
+    allTabs = await chrome.tabs.query({});
+  } catch {
+    return;
+  }
+
+  for (const tab of allTabs) {
+    if (!isDuxWorkspaceTab(tab)) continue;
+
+    processingTabs.add(tab.id);
+
+    try {
+      if (tab.pinned) {
+        await chrome.tabs.update(tab.id, { pinned: false });
+      }
+      await chrome.tabs.remove(tab.id);
+    } catch {
+      // Puede haberse cerrado sola durante la restauración
+    }
+
+    setTimeout(() => processingTabs.delete(tab.id), 1500);
+  }
+}
+/**
  * Abre las pestañas de trabajo de Dux (fijadas, en segundo plano) y
  * cierra la pestaña de `/duxnew/inicio` que disparó el flujo.
  *
@@ -801,13 +888,21 @@ chrome.runtime.onInstalled.addListener(async (details) => {
 
 /**
  * Chrome arrancó (con la extensión ya instalada y pestañas restauradas).
- * Mayor delay para que el navegador restaure completamente las pestañas
- * de la sesión anterior antes de verificar duplicados.
+ * 1) Limpia el workspace DUX restaurado (desfijar + cerrar).
+ * 2) Verifica duplicados en sitios protegidos.
+ *
+ * Se corre dos veces porque Chrome restaura pestañas fijadas de forma
+ * asíncrona; un solo pass temprano puede dejar alguna sin limpiar.
  */
 chrome.runtime.onStartup.addListener(async () => {
   await loadSettings();
-  setTimeout(checkExistingTabs, 1800);
-});
 
+  setTimeout(async () => {
+    await cleanupRestoredDuxWorkspaceTabs();
+    await checkExistingTabs();
+  }, 800);
+
+  setTimeout(cleanupRestoredDuxWorkspaceTabs, 2500);
+});
 // Carga inicial de settings (por si el SW se reinicia entre eventos)
 loadSettings();
