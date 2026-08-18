@@ -6,8 +6,8 @@
  *
  * Incluye además el módulo Auto-Launcher de Dux: al completar la carga
  * de `/duxnew/inicio`, abre las pestañas de trabajo fijadas y cierra
- * la pestaña de inicio. Al reiniciar Chrome limpia (desfija + cierra)
- * esas pestañas restauradas, porque MV3 no permite hacerlo al cerrar.
+ * la pestaña de inicio. Al reiniciar Chrome cierra en silencio las
+ * pestañas del workspace restauradas (MV3 no permite hacerlo al cerrar).
  *
  * Permisos utilizados:
  *   tabs          — leer URL de pestañas, cerrarlas, activarlas y consultar todas
@@ -60,6 +60,28 @@ const DUX_STOCK_SHEET_ID = '1JC1Nugx6ah0XP4Q_7P_3RvTVc6t7OPWAc_-XYIkPKXo';
 
 /** Clave en chrome.storage.session: Auto-Launcher ya ejecutado en esta sesión. */
 const DUX_LAUNCHED_SESSION_KEY = 'duxWorkspaceLaunched';
+
+/** Clave en chrome.storage.session: ventana de limpieza post-arranque (timestamp). */
+const DUX_STARTUP_CLEANUP_UNTIL_KEY = 'duxStartupCleanupUntil';
+
+/** Duración de la ventana de limpieza al arrancar Chrome (ms). */
+const DUX_STARTUP_CLEANUP_MS = 5000;
+
+/** Claves normalizadas de las URLs del Auto-Launcher (host + path). */
+const DUX_LAUNCH_URL_KEYS = new Set(
+  DUX_AUTO_LAUNCH_URLS.map((u) => {
+    try {
+      const url = new URL(u);
+      let pathname = url.pathname;
+      if (pathname.length > 1 && pathname.endsWith('/')) {
+        pathname = pathname.slice(0, -1);
+      }
+      return `${url.protocol}//${url.host}${pathname}`;
+    } catch {
+      return null;
+    }
+  }).filter(Boolean)
+);
 /** Configuración por defecto. Se aplica cuando no hay nada guardado en storage. */
 const DEFAULT_SETTINGS = {
   enabled: true,
@@ -108,6 +130,13 @@ const warnTimers = new Map();
  * El "ya lanzó en esta sesión" vive en chrome.storage.session.
  */
 let isLaunchingDux = false;
+
+/**
+ * Hasta cuándo (Date.now) está activa la limpieza de workspace al arrancar.
+ * Durante esta ventana las pestañas DUX restauradas se cierran en silencio
+ * (sin pasar por la lógica anti-duplicados / notificaciones).
+ */
+let startupCleanupUntil = 0;
 
 // ─── Utilidades de URL ────────────────────────────────────────────────────────
 
@@ -476,8 +505,15 @@ async function handleDuplicate(duplicateTabId, originalTab, url, isNewTab) {
 async function checkTab(tabId, url, isNewTab) {
   if (!settings.enabled)    return;
   if (isSystemUrl(url))     return;
-  if (!isProtectedUrl(url)) return;
   if (processingTabs.has(tabId)) return;
+
+  // Al arrancar: el workspace restaurado se cierra en silencio, no como "duplicado".
+  if (isStartupCleanupActive() && isDuxWorkspaceUrl(url, false)) {
+    await closeDuxWorkspaceTab(tabId);
+    return;
+  }
+
+  if (!isProtectedUrl(url)) return;
 
   const originalTab = await findOriginalTab(tabId, url);
   if (!originalTab) return;
@@ -506,9 +542,16 @@ async function checkExistingTabs() {
     return;
   }
 
-  // Filtrar solo pestañas de sitios protegidos con URL válida
+  const cleaningStartup = isStartupCleanupActive();
+
+  // Filtrar solo pestañas de sitios protegidos con URL válida.
+  // En el arranque se excluye el workspace DUX: lo limpia cleanupRestoredDuxWorkspaceTabs.
   const protectedTabs = allTabs
-    .filter((t) => t.url && !isSystemUrl(t.url) && isProtectedUrl(t.url))
+    .filter((t) => {
+      if (!t.url || isSystemUrl(t.url) || !isProtectedUrl(t.url)) return false;
+      if (cleaningStartup && isDuxWorkspaceTab(t)) return false;
+      return true;
+    })
     .sort((a, b) => a.id - b.id); // menor ID primero = más antiguo
 
   // urlMap: clave normalizada → primera pestaña encontrada (la más antigua)
@@ -629,55 +672,75 @@ async function markDuxLaunchedThisSession() {
 }
 
 /**
- * Devuelve true si alguna de las URLs del Auto-Launcher ya está abierta.
- * Evita reabrir el workspace cuando el usuario vuelve a `/duxnew/inicio`
- * con las pestañas de trabajo todavía presentes.
+ * True mientras corre la limpieza de pestañas restauradas al arrancar Chrome.
  *
- * @returns {Promise<boolean>}
+ * @returns {boolean}
  */
-async function isDuxWorkspaceAlreadyOpen() {
-  const launchKeys = new Set(
-    DUX_AUTO_LAUNCH_URLS.map(launchUrlKey).filter(Boolean)
-  );
-
-  let allTabs;
-  try {
-    allTabs = await chrome.tabs.query({});
-  } catch {
-    return false;
-  }
-
-  for (const tab of allTabs) {
-    if (!tab.url || isSystemUrl(tab.url)) continue;
-    const key = launchUrlKey(tab.url);
-    if (key && launchKeys.has(key)) return true;
-  }
-
-  return false;
+function isStartupCleanupActive() {
+  return Date.now() < startupCleanupUntil;
 }
 
 /**
- * Indica si una pestaña pertenece al workspace que abre el Auto-Launcher.
- * Incluye URLs exactas de launch y pestañas fijadas en hosts DUX / la planilla
- * (p.ej. restauradas por Chrome ya redirigidas al login).
+ * Termina la ventana de limpieza de arranque.
+ * Se llama al disparar el Auto-Launcher para no cerrar las pestañas
+ * que acabamos de abrir a propósito.
+ */
+function endStartupCleanup() {
+  startupCleanupUntil = 0;
+  chrome.storage.session.remove(DUX_STARTUP_CLEANUP_UNTIL_KEY).catch(() => {});
+}
+
+/**
+ * Activa la ventana de limpieza post-arranque y persiste el deadline
+ * por si el service worker se reinicia durante esos segundos.
  *
- * @param {chrome.tabs.Tab} tab
+ * @param {number} [durationMs]
+ */
+async function beginStartupCleanup(durationMs = DUX_STARTUP_CLEANUP_MS) {
+  startupCleanupUntil = Date.now() + durationMs;
+  try {
+    await chrome.storage.session.set({
+      [DUX_STARTUP_CLEANUP_UNTIL_KEY]: startupCleanupUntil,
+    });
+  } catch {
+    // El flag en memoria alcanza si el SW no muere
+  }
+}
+
+/**
+ * Restaura el deadline de limpieza si el SW se reinició a mitad del arranque.
+ */
+async function restoreStartupCleanupDeadline() {
+  if (isStartupCleanupActive()) return;
+  try {
+    const data = await chrome.storage.session.get(DUX_STARTUP_CLEANUP_UNTIL_KEY);
+    const until = data[DUX_STARTUP_CLEANUP_UNTIL_KEY];
+    if (typeof until === 'number' && Date.now() < until) {
+      startupCleanupUntil = until;
+    }
+  } catch {
+    // ignorar
+  }
+}
+
+/**
+ * ¿La URL pertenece al workspace del Auto-Launcher?
+ *
+ * @param {string} rawUrl
+ * @param {boolean} treatPinnedHostAsWorkspace - si true, cualquier URL en hosts
+ *   DUX / planilla cuenta (para pestañas fijadas redirigidas al login).
  * @returns {boolean}
  */
-function isDuxWorkspaceTab(tab) {
-  if (!tab || !tab.url || isSystemUrl(tab.url)) return false;
+function isDuxWorkspaceUrl(rawUrl, treatPinnedHostAsWorkspace) {
+  if (!rawUrl || isSystemUrl(rawUrl)) return false;
 
-  const launchKeys = new Set(
-    DUX_AUTO_LAUNCH_URLS.map(launchUrlKey).filter(Boolean)
-  );
-  const key = launchUrlKey(tab.url);
-  if (key && launchKeys.has(key)) return true;
+  const key = launchUrlKey(rawUrl);
+  if (key && DUX_LAUNCH_URL_KEYS.has(key)) return true;
 
-  // Tras restaurar sesión, la URL puede ser login u otra ruta del mismo host.
-  if (!tab.pinned) return false;
+  if (!treatPinnedHostAsWorkspace) return false;
 
   try {
-    const url = new URL(tab.url);
+    const url = new URL(rawUrl);
     const host = url.hostname.toLowerCase();
 
     if (DUX_WORKSPACE_HOSTS.some((h) => host === h || host.endsWith('.' + h))) {
@@ -698,13 +761,50 @@ function isDuxWorkspaceTab(tab) {
 }
 
 /**
- * Al arrancar Chrome, desfija y cierra las pestañas del workspace DUX
+ * Indica si una pestaña pertenece al workspace que abre el Auto-Launcher.
+ *
+ * @param {chrome.tabs.Tab} tab
+ * @returns {boolean}
+ */
+function isDuxWorkspaceTab(tab) {
+  if (!tab) return false;
+  const url = tab.url || tab.pendingUrl;
+  if (!url || isSystemUrl(url)) return false;
+
+  // URLs exactas del launch: siempre (aunque Chrome ya las haya desfijado).
+  if (isDuxWorkspaceUrl(url, false)) return true;
+
+  // En hosts DUX / planilla solo si sigue fijada (caso login tras restore).
+  if (tab.pinned && isDuxWorkspaceUrl(url, true)) return true;
+
+  return false;
+}
+
+/**
+ * Cierra una pestaña del workspace en silencio (sin notificación de duplicado).
+ * No hace falta desfijar antes: tabs.remove funciona con pestañas fijadas.
+ *
+ * @param {number} tabId
+ */
+async function closeDuxWorkspaceTab(tabId) {
+  if (processingTabs.has(tabId)) return;
+  processingTabs.add(tabId);
+
+  try {
+    await chrome.tabs.remove(tabId);
+  } catch {
+    // Puede haberse cerrado sola durante la restauración
+  }
+
+  setTimeout(() => processingTabs.delete(tabId), 1000);
+}
+
+/**
+ * Al arrancar Chrome, cierra en paralelo las pestañas del workspace DUX
  * que Chrome restauró de la sesión anterior.
  *
- * No es posible desfijar al cerrar el navegador (MV3 no notifica a tiempo
- * antes de guardar la sesión). Esta limpieza al startup evita pestañas
- * fijadas sin sesión válida que, tras el login, caen en `/duxnew/inicio`
- * y bloquean un nuevo Auto-Launcher.
+ * No es posible limpiarlas al cerrar el navegador (MV3 no notifica a tiempo).
+ * Durante la ventana de startup también se cierran al vuelo desde onCreated/onUpdated.
  */
 async function cleanupRestoredDuxWorkspaceTabs() {
   let allTabs;
@@ -714,23 +814,48 @@ async function cleanupRestoredDuxWorkspaceTabs() {
     return;
   }
 
-  for (const tab of allTabs) {
-    if (!isDuxWorkspaceTab(tab)) continue;
-
-    processingTabs.add(tab.id);
-
-    try {
-      if (tab.pinned) {
-        await chrome.tabs.update(tab.id, { pinned: false });
-      }
-      await chrome.tabs.remove(tab.id);
-    } catch {
-      // Puede haberse cerrado sola durante la restauración
-    }
-
-    setTimeout(() => processingTabs.delete(tab.id), 1500);
-  }
+  const toClose = allTabs.filter(isDuxWorkspaceTab);
+  await Promise.all(toClose.map((tab) => closeDuxWorkspaceTab(tab.id)));
 }
+
+/**
+ * Si estamos en la ventana de limpieza de arranque y la pestaña es del
+ * workspace, la cierra en silencio y devuelve true (el caller no debe
+ * pasar por anti-duplicados ni Auto-Launcher).
+ *
+ * @param {chrome.tabs.Tab} tab
+ * @returns {Promise<boolean>}
+ */
+async function tryCleanupRestoredDuxTab(tab) {
+  if (!isStartupCleanupActive()) return false;
+  if (!isDuxWorkspaceTab(tab)) return false;
+  await closeDuxWorkspaceTab(tab.id);
+  return true;
+}
+/**
+ * Cierra pestañas que ya tienen las URLs del Auto-Launcher.
+ * Usado antes de relanzar para no quedar bloqueados por restos de otra sesión
+ * (p.ej. pestañas restauradas en un perfil con "continuar donde lo dejaste").
+ *
+ * @param {number} [exceptTabId]
+ */
+async function closeExistingDuxLaunchTabs(exceptTabId) {
+  let allTabs;
+  try {
+    allTabs = await chrome.tabs.query({});
+  } catch {
+    return;
+  }
+
+  const toClose = allTabs.filter((tab) => {
+    if (exceptTabId != null && tab.id === exceptTabId) return false;
+    const url = tab.url || tab.pendingUrl;
+    return url && isDuxWorkspaceUrl(url, false);
+  });
+
+  await Promise.all(toClose.map((tab) => closeDuxWorkspaceTab(tab.id)));
+}
+
 /**
  * Abre las pestañas de trabajo de Dux (fijadas, en segundo plano) y
  * cierra la pestaña de `/duxnew/inicio` que disparó el flujo.
@@ -738,7 +863,8 @@ async function cleanupRestoredDuxWorkspaceTabs() {
  * Se ejecuta una sola vez por sesión de navegador:
  *   - Lock en memoria (`isLaunchingDux`) contra disparos concurrentes.
  *   - Flag en `chrome.storage.session` contra revisitas a `/duxnew/inicio`.
- *   - Si alguna pestaña del workspace ya está abierta, no relanza ni cierra inicio.
+ *   - Si quedaron pestañas viejas del workspace, las cierra y lanza de nuevo
+ *     (evita el falso “ya está abierto” tras restaurar sesión en otro perfil).
  *
  * No altera la lógica anti-duplicados: las pestañas creadas pasan por
  * los listeners normales de DualBlock.
@@ -747,15 +873,18 @@ async function cleanupRestoredDuxWorkspaceTabs() {
  */
 async function launchDuxWorkspace(triggerTabId) {
   if (isLaunchingDux) return;
-  if (await hasLaunchedDuxThisSession()) return;
-  if (await isDuxWorkspaceAlreadyOpen()) {
-    await markDuxLaunchedThisSession();
-    return;
-  }
 
+  // Marcar ya (antes de cualquier await) para que la limpieza de arranque
+  // no mate las pestañas que vamos a crear, y para serializar reentradas.
   isLaunchingDux = true;
+  endStartupCleanup();
 
   try {
+    if (await hasLaunchedDuxThisSession()) return;
+
+    // Restos restaurados / de otro login no deben bloquear el lanzamiento.
+    await closeExistingDuxLaunchTabs(triggerTabId);
+
     for (let i = 0; i < DUX_AUTO_LAUNCH_URLS.length; i++) {
       if (i > 0) {
         await delay(DUX_LAUNCH_STAGGER_MS);
@@ -795,6 +924,22 @@ async function launchDuxWorkspace(triggerTabId) {
 chrome.tabs.onCreated.addListener((tab) => {
   newlyCreatedTabs.add(tab.id);
 
+  // Arranque: cerrar workspace restaurado al instante (antes del anti-duplicados).
+  // No limpiar mientras el Auto-Launcher está creando pestañas a propósito.
+  if (isStartupCleanupActive() && !isLaunchingDux) {
+    tryCleanupRestoredDuxTab(tab).then((closed) => {
+      if (closed) {
+        newlyCreatedTabs.delete(tab.id);
+        return;
+      }
+      const url = tab.url || tab.pendingUrl;
+      if (url && !isSystemUrl(url)) {
+        checkTab(tab.id, url, true);
+      }
+    });
+    return;
+  }
+
   const url = tab.url || tab.pendingUrl;
   if (url && !isSystemUrl(url)) {
     checkTab(tab.id, url, true);
@@ -809,24 +954,39 @@ chrome.tabs.onCreated.addListener((tab) => {
  *   Si el tabId está en newlyCreatedTabs → tab nueva → isNewTab = true (cerrar).
  *   Si no está → navegación in-place → isNewTab = false (volver atrás).
  *
- * Rama Auto-Launcher (changeInfo.status === 'complete'):
- *   Si la URL contiene `/duxnew/inicio`, abre las pestañas de trabajo
- *   y cierra la de inicio (una sola vez por secuencia, via isLaunchingDux).
+ * Rama Auto-Launcher:
+ *   Dispara al detectar `/duxnew/inicio` por cambio de URL o por carga completa.
+ *   (DUX a veces llega a inicio vía navegación SPA tras el login; el click en
+ *   Home sí hacía full load — por eso antes solo funcionaba en el segundo caso.)
  */
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  // Usar changeInfo.url si tab.url aún no se actualizó (típico al restaurar sesión).
+  const effectiveTab = changeInfo.url ? { ...tab, url: changeInfo.url } : tab;
+  const url = effectiveTab.url || changeInfo.url;
+
+  // Auto-Launcher de Dux — post-login (URL change o load complete)
+  if (url && isDuxInicioUrl(url) && (changeInfo.url || changeInfo.status === 'complete')) {
+    launchDuxWorkspace(tabId);
+  }
+
+  // Arranque: cerrar workspace apenas tenga URL (sin notificar como duplicado).
+  if (
+    isStartupCleanupActive() &&
+    !isLaunchingDux &&
+    (changeInfo.url || changeInfo.status === 'complete')
+  ) {
+    if (isDuxWorkspaceTab(effectiveTab)) {
+      newlyCreatedTabs.delete(tabId);
+      closeDuxWorkspaceTab(tabId);
+      return;
+    }
+  }
+
   // DualBlock — detección de duplicados
   if (changeInfo.url) {
     const isNewTab = newlyCreatedTabs.has(tabId);
     newlyCreatedTabs.delete(tabId);
     checkTab(tabId, changeInfo.url, isNewTab);
-  }
-
-  // Auto-Launcher de Dux — post-login
-  if (changeInfo.status === 'complete') {
-    const url = (tab && tab.url) || changeInfo.url;
-    if (isDuxInicioUrl(url)) {
-      launchDuxWorkspace(tabId);
-    }
   }
 });
 
@@ -844,6 +1004,16 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     chrome.notifications.clear(entry.notifId).catch(() => {});
     warnTimers.delete(tabId);
   }
+});
+
+/**
+ * Mensaje del content script en erp.duxsoftware.com.ar:
+ * la página (o el router SPA) llegó a `/duxnew/inicio`.
+ */
+chrome.runtime.onMessage.addListener((message, sender) => {
+  if (!message || message.type !== 'dux-inicio') return;
+  if (!sender.tab || sender.tab.id == null) return;
+  launchDuxWorkspace(sender.tab.id);
 });
 
 /**
@@ -888,21 +1058,23 @@ chrome.runtime.onInstalled.addListener(async (details) => {
 
 /**
  * Chrome arrancó (con la extensión ya instalada y pestañas restauradas).
- * 1) Limpia el workspace DUX restaurado (desfijar + cerrar).
- * 2) Verifica duplicados en sitios protegidos.
- *
- * Se corre dos veces porque Chrome restaura pestañas fijadas de forma
- * asíncrona; un solo pass temprano puede dejar alguna sin limpiar.
+ * Limpia el workspace DUX de inmediato y en paralelo; el anti-duplicados
+ * espera un momento para no competir con esa limpieza.
  */
 chrome.runtime.onStartup.addListener(async () => {
   await loadSettings();
+  await beginStartupCleanup();
+  await cleanupRestoredDuxWorkspaceTabs();
 
-  setTimeout(async () => {
-    await cleanupRestoredDuxWorkspaceTabs();
-    await checkExistingTabs();
-  }, 800);
+  // Segunda pasada por si Chrome restaura alguna pestaña fijada más tarde.
+  setTimeout(cleanupRestoredDuxWorkspaceTabs, 600);
+  setTimeout(cleanupRestoredDuxWorkspaceTabs, 1500);
 
-  setTimeout(cleanupRestoredDuxWorkspaceTabs, 2500);
+  // Anti-duplicados genérico después de la limpieza inicial.
+  setTimeout(checkExistingTabs, 700);
 });
+
+// Si el SW se reinicia durante el arranque, recuperar la ventana de limpieza.
+restoreStartupCleanupDeadline();
 // Carga inicial de settings (por si el SW se reinicia entre eventos)
 loadSettings();
