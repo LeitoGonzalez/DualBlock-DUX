@@ -79,9 +79,12 @@ Lista de dominios donde se aplica la protección. Por defecto está vacía: el u
 
 - **Agregar** un dominio: escribirlo sin protocolo (p.ej. `erp.duxsoftware.com.ar`) y hacer clic en "+ Agregar sitio".
 - **Activar/desactivar** cada dominio individualmente con su switch.
+- **Máx.**: máximo de pestañas abiertas para ese sitio (vacío o `0` = sin límite). Si se excede, DualBlock muestra un aviso en la página durante 3 segundos, cierra la pestaña nueva y enfoca una ya abierta.
 - **Eliminar** un dominio con el botón ×.
 
 La extensión también protege subdominios. Si agregás `duxsoftware.com.ar`, también cubrirá `erp.duxsoftware.com.ar`.
+
+Las pestañas del Auto-Launcher DUX no se cierran por este límite (para no romper el workspace de 4 herramientas).
 
 ### Modo de detección
 
@@ -209,6 +212,8 @@ Al arrancar Chrome (`runtime.onStartup`), cierra en paralelo las pestañas del w
 | `storage` | Persistir configuración (`storage.sync`), estadísticas (`storage.local`) y flag de sesión del Auto-Launcher (`storage.session`) |
 | `notifications` | Mostrar aviso cuando se bloquea una pestaña duplicada |
 | `windows` | Enfocar la ventana que contiene la pestaña original |
+| `scripting` | Mostrar el aviso en la página al exceder el máximo de pestañas por sitio |
+| Hosts HTTP/HTTPS | Inyectar ese aviso en los sitios protegidos configurados |
 
 ---
 
@@ -245,4 +250,4 @@ DualBlock-DUX/
 
 ## Versión
 
-**1.0.0** — Corporate Edition: DualBlock Core + Auto-Launcher DUX ERP
+**1.0.1** — Máximo de pestañas configurable por sitio (aviso en página + cierre)

@@ -46,6 +46,7 @@
       <h2 class="card-title">Sitios protegidos</h2>
       <p class="card-desc">
         La extensión solo actúa en estos dominios. Agregá cualquier sitio web donde quieras evitar pestañas duplicadas.
+        En cada sitio podés definir un <strong>máximo de pestañas</strong> (vacío o 0 = sin límite).
       </p>
 
       <ul class="site-list" id="site-list" role="list">
@@ -170,8 +171,9 @@
     <!-- ── Pie informativo ───────────────────────────────────────────── -->
     <footer class="page-footer">
       <p>
-        Las pestañas con <strong>diferentes URLs</strong> nunca se ven afectadas.
-        Solo se cierra una pestaña si hay otra con exactamente la misma dirección ya abierta.
+        Sin límite configurado, las pestañas con <strong>diferentes URLs</strong> pueden coexistir;
+        solo se cierra un duplicado (misma URL). Con un máximo por sitio, al excederlo se avisa
+        en la página y se cierra la pestaña nueva enfocando una ya abierta.
       </p>
       <p class="footer-privacy">
         🔒 Toda la información permanece en tu navegador.

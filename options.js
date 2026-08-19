@@ -144,9 +144,20 @@ function renderMainToggle(enabled) {
 // ─── Render de la lista de sitios ─────────────────────────────────────────────
 
 /**
+ * Normaliza el máximo de pestañas de un sitio (0 / inválido = sin límite).
+ * @param {unknown} value
+ * @returns {number}
+ */
+function normalizeMaxTabs(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 1) return 0;
+  return Math.min(99, Math.floor(n));
+}
+
+/**
  * Renderiza la lista de sitios protegidos.
- * Crea un elemento <li> por cada sitio con su toggle y botón de eliminar.
- * @param {Array<{domain: string, enabled: boolean}>} sites
+ * Crea un elemento <li> por cada sitio con máximo, toggle y botón de eliminar.
+ * @param {Array<{domain: string, enabled: boolean, maxTabs?: number}>} sites
  */
 function renderSiteList(sites) {
   elSiteList.innerHTML = '';
@@ -178,6 +189,38 @@ function renderSiteList(sites) {
     domain.className = 'site-domain';
     domain.textContent = site.domain;
     domain.title = site.domain;
+
+    // Máximo de pestañas (0 / vacío = sin límite)
+    const maxWrap = document.createElement('div');
+    maxWrap.className = 'site-max-wrap';
+
+    const maxLabel = document.createElement('label');
+    maxLabel.className = 'site-max-label';
+    maxLabel.htmlFor = `site-max-${index}`;
+    maxLabel.textContent = 'Máx.';
+
+    const maxInput = document.createElement('input');
+    maxInput.type = 'number';
+    maxInput.id = `site-max-${index}`;
+    maxInput.className = 'site-max-input';
+    maxInput.min = '0';
+    maxInput.max = '99';
+    maxInput.step = '1';
+    maxInput.placeholder = '∞';
+    maxInput.title = 'Máximo de pestañas para este sitio (0 o vacío = sin límite)';
+    maxInput.setAttribute('aria-label', `Máximo de pestañas para ${site.domain}`);
+    const maxTabs = normalizeMaxTabs(site.maxTabs);
+    maxInput.value = maxTabs > 0 ? String(maxTabs) : '';
+    maxInput.addEventListener('change', () => {
+      currentSettings.sites[index].maxTabs = normalizeMaxTabs(maxInput.value);
+      maxInput.value = currentSettings.sites[index].maxTabs > 0
+        ? String(currentSettings.sites[index].maxTabs)
+        : '';
+      saveSettings(currentSettings);
+    });
+
+    maxWrap.appendChild(maxLabel);
+    maxWrap.appendChild(maxInput);
 
     // Toggle pequeño para activar/desactivar el sitio individualmente
     const siteToggleLabel = document.createElement('label');
@@ -218,6 +261,7 @@ function renderSiteList(sites) {
 
     li.appendChild(indicator);
     li.appendChild(domain);
+    li.appendChild(maxWrap);
     li.appendChild(siteToggleLabel);
     li.appendChild(removeBtn);
     elSiteList.appendChild(li);
@@ -272,7 +316,7 @@ function addSite() {
   }
 
   setAddSiteError('');
-  currentSettings.sites.push({ domain, enabled: true });
+  currentSettings.sites.push({ domain, enabled: true, maxTabs: 0 });
   saveSettings(currentSettings);
   renderSiteList(currentSettings.sites);
   elNewSiteInput.value = '';

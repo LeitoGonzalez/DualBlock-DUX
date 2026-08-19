@@ -26,6 +26,12 @@ const STORAGE_STATS_KEY    = 'stats';
 /** Tiempo de espera en modo "advertencia" antes de cerrar automáticamente (ms). */
 const WARN_TIMEOUT_MS = 8000;
 
+/** Segundos de aviso en-página antes de cerrar por límite de pestañas. */
+const TAB_LIMIT_WARN_SECONDS = 3;
+
+/** Delay en ms del aviso de límite de pestañas. */
+const TAB_LIMIT_WARN_MS = TAB_LIMIT_WARN_SECONDS * 1000;
+
 /**
  * Fragmento de ruta que dispara el Auto-Launcher de Dux.
  * Se busca dentro del pathname (cubre query string / trailing slash).
@@ -42,8 +48,8 @@ const DUX_LAUNCH_STAGGER_MS = 100;
 const DUX_AUTO_LAUNCH_URLS = [
   'https://erp.duxsoftware.com.ar/duxnew/ventas/pos',
   'https://erp.duxsoftware.com.ar/pages/facturacion/consultas/consultaPrecioStock.faces',
-  'https://docs.google.com/spreadsheets/d/1JC1Nugx6ah0XP4Q_7P_3RvTVc6t7OPWAc_-XYIkPKXo/edit?gid=1806730843#gid=1806730843',
   'https://catalogo.duxsoftware.com.ar/motos',
+  'https://docs.google.com/spreadsheets/d/1JC1Nugx6ah0XP4Q_7P_3RvTVc6t7OPWAc_-XYIkPKXo/edit?gid=1806730843#gid=1806730843',
 ];
 
 /**
@@ -125,6 +131,12 @@ const newlyCreatedTabs = new Set();
 const warnTimers = new Map();
 
 /**
+ * Timers del límite de pestañas por sitio.
+ * Mapa: tabId → timerId
+ */
+const tabLimitTimers = new Map();
+
+/**
  * Lock del Auto-Launcher de Dux.
  * Evita re-disparos concurrentes mientras la secuencia está en curso.
  * El "ya lanzó en esta sesión" vive en chrome.storage.session.
@@ -187,25 +199,89 @@ function normalizeUrl(rawUrl, mode) {
  * @returns {boolean}
  */
 function isProtectedUrl(rawUrl) {
-  if (!rawUrl) return false;
+  return Boolean(findMatchingSite(rawUrl));
+}
+
+/**
+ * Devuelve el sitio protegido activo que coincide con la URL, o null.
+ *
+ * @param {string} rawUrl
+ * @returns {{domain: string, enabled: boolean, maxTabs?: number}|null}
+ */
+function findMatchingSite(rawUrl) {
+  if (!rawUrl) return null;
 
   let url;
   try {
     url = new URL(rawUrl);
   } catch {
-    return false;
+    return null;
   }
 
-  // Solo HTTP y HTTPS; ignorar chrome://, file://, etc.
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
 
   const host = url.hostname.toLowerCase();
 
-  return settings.sites.some((site) => {
-    if (!site.enabled) return false;
-    const domain = site.domain.toLowerCase().trim();
-    // Coincidencia exacta o subdominio del dominio configurado
-    return host === domain || host.endsWith('.' + domain);
+  for (const site of settings.sites) {
+    if (!site.enabled) continue;
+    const domain = String(site.domain || '').toLowerCase().trim();
+    if (!domain) continue;
+    if (host === domain || host.endsWith('.' + domain)) {
+      return site;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Máximo de pestañas configurado para un sitio (0 = sin límite).
+ *
+ * @param {{maxTabs?: number}|null|undefined} site
+ * @returns {number}
+ */
+function siteMaxTabs(site) {
+  if (!site) return 0;
+  const n = Number(site.maxTabs);
+  if (!Number.isFinite(n) || n < 1) return 0;
+  return Math.min(99, Math.floor(n));
+}
+
+/**
+ * True si host pertenece al dominio configurado (exacto o subdominio).
+ *
+ * @param {string} host
+ * @param {string} domain
+ * @returns {boolean}
+ */
+function hostMatchesDomain(host, domain) {
+  const h = host.toLowerCase();
+  const d = domain.toLowerCase().trim();
+  return h === d || h.endsWith('.' + d);
+}
+
+/**
+ * Pestañas abiertas que pertenecen a un dominio protegido.
+ *
+ * @param {string} domain
+ * @returns {Promise<chrome.tabs.Tab[]>}
+ */
+async function getTabsForDomain(domain) {
+  let allTabs;
+  try {
+    allTabs = await chrome.tabs.query({});
+  } catch {
+    return [];
+  }
+
+  return allTabs.filter((tab) => {
+    if (!tab.url || isSystemUrl(tab.url)) return false;
+    try {
+      const host = new URL(tab.url).hostname;
+      return hostMatchesDomain(host, domain);
+    } catch {
+      return false;
+    }
   });
 }
 
@@ -492,11 +568,133 @@ async function handleDuplicate(duplicateTabId, originalTab, url, isNewTab) {
   }
 }
 
+// ─── Límite de pestañas por sitio ─────────────────────────────────────────────
+
+/**
+ * Muestra un banner fijo en la pestaña avisando que se cerrará por límite.
+ *
+ * @param {number} tabId
+ * @param {number} maxTabs
+ * @param {number} seconds
+ */
+async function showTabLimitBanner(tabId, maxTabs, seconds) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (limit, secs) => {
+        const id = 'dualblock-tab-limit-banner';
+        const existing = document.getElementById(id);
+        if (existing) existing.remove();
+
+        const el = document.createElement('div');
+        el.id = id;
+        el.setAttribute('role', 'alert');
+        el.textContent =
+          `DualBlock: este sitio permite como máximo ${limit} pestaña(s). ` +
+          `Esta pestaña se cerrará en ${secs} s…`;
+        el.style.cssText = [
+          'position:fixed',
+          'top:0',
+          'left:0',
+          'right:0',
+          'z-index:2147483647',
+          'padding:14px 18px',
+          'background:#1a1a1a',
+          'color:#fff',
+          'font:600 14px/1.4 system-ui,sans-serif',
+          'text-align:center',
+          'box-shadow:0 2px 12px rgba(0,0,0,.35)',
+        ].join(';');
+        (document.body || document.documentElement).appendChild(el);
+      },
+      args: [maxTabs, seconds],
+    });
+  } catch {
+    // Páginas restringidas o aún sin documento: se cierra igual tras el timer
+  }
+}
+
+/**
+ * Cierra la pestaña excedente tras el aviso y enfoca una pestaña ya abierta del sitio.
+ *
+ * @param {number} excessTabId
+ * @param {chrome.tabs.Tab} focusTab
+ * @param {number} maxTabs
+ */
+async function handleTabLimitExceeded(excessTabId, focusTab, maxTabs) {
+  if (processingTabs.has(excessTabId) || tabLimitTimers.has(excessTabId)) return;
+
+  processingTabs.add(excessTabId);
+
+  await showTabLimitBanner(excessTabId, maxTabs, TAB_LIMIT_WARN_SECONDS);
+
+  const timerId = setTimeout(async () => {
+    tabLimitTimers.delete(excessTabId);
+
+    try {
+      await chrome.tabs.remove(excessTabId);
+    } catch {
+      // Puede haberse cerrado sola
+    }
+
+    if (focusTab && focusTab.id != null) {
+      try {
+        await chrome.tabs.update(focusTab.id, { active: true });
+        await chrome.windows.update(focusTab.windowId, { focused: true });
+      } catch {
+        // La pestaña de foco puede haberse cerrado
+      }
+    }
+
+    setTimeout(() => processingTabs.delete(excessTabId), 1500);
+  }, TAB_LIMIT_WARN_MS);
+
+  tabLimitTimers.set(excessTabId, timerId);
+}
+
+/**
+ * Si el sitio tiene máximo de pestañas y se excedió, avisa y cierra la nueva.
+ * No actúa durante el Auto-Launcher de Dux.
+ *
+ * @param {number} tabId
+ * @param {string} url
+ * @returns {Promise<boolean>} true si se está aplicando el límite
+ */
+async function checkTabLimit(tabId, url) {
+  if (isLaunchingDux) return false;
+  // Las pestañas del Auto-Launcher Dux no se cierran por este límite.
+  if (isDuxWorkspaceUrl(url, false)) return false;
+
+  const site = findMatchingSite(url);
+  const max = siteMaxTabs(site);
+  if (!site || max < 1) return false;
+
+  const siteTabs = await getTabsForDomain(site.domain);
+  if (siteTabs.length <= max) return false;
+
+  // Conservar las más antiguas (menor ID); cerrar la que disparó si es excedente.
+  const sorted = [...siteTabs].sort((a, b) => a.id - b.id);
+  const keepIds = new Set(sorted.slice(0, max).map((t) => t.id));
+
+  if (keepIds.has(tabId)) {
+    const excess = [...sorted].reverse().find(
+      (t) => !keepIds.has(t.id) && !isDuxWorkspaceUrl(t.url, false)
+    );
+    if (!excess) return false;
+    const focusTab = sorted.find((t) => t.id !== excess.id) || sorted[0];
+    await handleTabLimitExceeded(excess.id, focusTab, max);
+    return true;
+  }
+
+  const focusTab = sorted.find((t) => t.id !== tabId) || sorted[0];
+  await handleTabLimitExceeded(tabId, focusTab, max);
+  return true;
+}
+
 // ─── Punto de entrada: verificar una pestaña ──────────────────────────────────
 
 /**
- * Verifica si una pestaña con una URL determinada es duplicada de otra ya abierta.
- * Llama a handleDuplicate si se confirma la duplicación.
+ * Verifica duplicados y, si no hay, el límite de pestañas del sitio.
  *
  * @param {number} tabId
  * @param {string} url
@@ -516,9 +714,12 @@ async function checkTab(tabId, url, isNewTab) {
   if (!isProtectedUrl(url)) return;
 
   const originalTab = await findOriginalTab(tabId, url);
-  if (!originalTab) return;
+  if (originalTab) {
+    await handleDuplicate(tabId, originalTab, url, isNewTab);
+    return;
+  }
 
-  await handleDuplicate(tabId, originalTab, url, isNewTab);
+  await checkTabLimit(tabId, url);
 }
 
 // ─── Verificación inicial de pestañas existentes ──────────────────────────────
@@ -574,9 +775,57 @@ async function checkExistingTabs() {
       setTimeout(() => processingTabs.delete(tab.id), 1500);
     }
   }
+
+  // Después de limpiar duplicados, aplicar máximos por sitio (sin banner en arranque).
+  await enforceTabLimitsQuietly();
+}
+
+/**
+ * Cierra en silencio las pestañas que exceden el máximo por sitio
+ * (p.ej. al arrancar Chrome). Conserva las de menor ID.
+ */
+async function enforceTabLimitsQuietly() {
+  if (isLaunchingDux) return;
+
+  for (const site of settings.sites) {
+    if (!site.enabled) continue;
+    const max = siteMaxTabs(site);
+    if (max < 1) continue;
+
+    const siteTabs = await getTabsForDomain(site.domain);
+    if (siteTabs.length <= max) continue;
+
+    const sorted = [...siteTabs].sort((a, b) => a.id - b.id);
+    const excess = sorted
+      .slice(max)
+      .filter((tab) => !isDuxWorkspaceUrl(tab.url, false));
+
+    for (const tab of excess) {
+      processingTabs.add(tab.id);
+      try {
+        await chrome.tabs.remove(tab.id);
+      } catch { /* ignorar */ }
+      setTimeout(() => processingTabs.delete(tab.id), 1500);
+    }
+  }
 }
 
 // ─── Carga de configuración ───────────────────────────────────────────────────
+
+/**
+ * Normaliza la lista de sitios (maxTabs, enabled, domain).
+ *
+ * @param {unknown} sites
+ * @returns {Array<{domain: string, enabled: boolean, maxTabs: number}>}
+ */
+function normalizeSites(sites) {
+  if (!Array.isArray(sites)) return [];
+  return sites.map((site) => ({
+    domain: String(site?.domain || '').trim(),
+    enabled: site?.enabled !== false,
+    maxTabs: siteMaxTabs(site),
+  })).filter((s) => s.domain);
+}
 
 /**
  * Carga la configuración guardada desde chrome.storage.sync.
@@ -587,9 +836,7 @@ async function loadSettings() {
     const data = await chrome.storage.sync.get(STORAGE_SETTINGS_KEY);
     if (data[STORAGE_SETTINGS_KEY]) {
       settings = { ...DEFAULT_SETTINGS, ...data[STORAGE_SETTINGS_KEY] };
-      if (!Array.isArray(settings.sites)) {
-        settings.sites = DEFAULT_SETTINGS.sites;
-      }
+      settings.sites = normalizeSites(settings.sites);
     }
   } catch {
     settings = { ...DEFAULT_SETTINGS };
@@ -1004,6 +1251,12 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     chrome.notifications.clear(entry.notifId).catch(() => {});
     warnTimers.delete(tabId);
   }
+
+  const limitTimer = tabLimitTimers.get(tabId);
+  if (limitTimer) {
+    clearTimeout(limitTimer);
+    tabLimitTimers.delete(tabId);
+  }
 });
 
 /**
@@ -1025,9 +1278,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
     const newValue = changes[STORAGE_SETTINGS_KEY].newValue;
     if (newValue) {
       settings = { ...DEFAULT_SETTINGS, ...newValue };
-      if (!Array.isArray(settings.sites)) {
-        settings.sites = DEFAULT_SETTINGS.sites;
-      }
+      settings.sites = normalizeSites(settings.sites);
     }
   }
 });

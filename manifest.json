@@ -2,18 +2,20 @@
   "manifest_version": 3,
   "name": "DualBlock",
   "short_name": "DualBlock",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Evita abrir pestañas duplicadas en cualquier sitio web, previniendo conflictos de sesión y datos.",
 
   "permissions": [
     "tabs",
     "storage",
     "notifications",
-    "windows"
+    "windows",
+    "scripting"
   ],
 
   "host_permissions": [
-    "https://erp.duxsoftware.com.ar/*"
+    "http://*/*",
+    "https://*/*"
   ],
 
   "background": {

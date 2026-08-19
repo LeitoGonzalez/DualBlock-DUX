@@ -304,6 +304,7 @@ code {
 
 .site-domain {
   flex: 1;
+  min-width: 0;
   font-size: var(--font-size-sm);
   font-weight: 500;
   font-family: 'Courier New', Courier, monospace;
@@ -311,6 +312,35 @@ code {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.site-max-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.site-max-label {
+  font-size: var(--font-size-xs, 0.75rem);
+  color: var(--color-text-muted);
+  white-space: nowrap;
+}
+
+.site-max-input {
+  width: 3.25rem;
+  padding: 4px 6px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-input);
+  background: var(--color-surface, var(--color-bg));
+  color: var(--color-text-primary);
+  font-size: var(--font-size-sm);
+  text-align: center;
+}
+
+.site-max-input:focus {
+  outline: none;
+  border-color: var(--color-accent);
 }
 
 /* Toggle pequeño dentro de cada sitio */
